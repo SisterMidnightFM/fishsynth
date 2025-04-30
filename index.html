@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Interactive Fish Particle Magnet</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      height: 100%;
+      background-color: #000;
+      font-family: sans-serif;
+    }
+
+    canvas {
+      display: block;
+    }
+
+    #resetButton {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      width: 40px;
+      height: 40px;
+      background-color: white;
+      color: black;
+      border: none;
+      border-radius: 50%;
+      cursor: pointer;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #resetButton::before {
+      content: '↻';
+      font-size: 20px;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <button id="resetButton"></button>
+  <canvas id="particleCanvas"></canvas>
+
+  <!-- Load configuration file first -->
+  <script src="config.js"></script>
+  
+  <script>
+    const canvas = document.getElementById('particleCanvas');
+    const ctx = canvas.getContext('2d');
+    let particles = [];
+    let mouse = { x: -9999, y: -9999 };
+    let paths = [];
+    let isDrawing = false;
+    let flashes = []; // Array to store flash circles
+    let lastToneTime = 0; // Track the last time a tone was played
+
+    // Apply UI settings from config
+    const resetButton = document.getElementById('resetButton');
+    resetButton.style.width = `${CONFIG.ui.resetButtonSize}px`;
+    resetButton.style.height = `${CONFIG.ui.resetButtonSize}px`;
+    resetButton.style.backgroundColor = CONFIG.ui.resetButtonColor;
+    resetButton.style.color = CONFIG.ui.resetButtonTextColor;
+
+    // Audio setup
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    let convolver;
+
+    // Create a reverb effect
+    function createReverb() {
+      convolver = audioContext.createConvolver();
+
+      // Create an impulse response for light reverb
+      const sampleRate = audioContext.sampleRate;
+      const length = sampleRate * CONFIG.audio.reverbDuration;
+      const impulse = audioContext.createBuffer(2, length, sampleRate);
+      const left = impulse.getChannelData(0);
+      const right = impulse.getChannelData(1);
+
+      for (let i = 0; i < length; i++) {
+        const decay = Math.pow(1 - i / length, 2); // Exponential decay
+        left[i] = (Math.random() * 2 - 1) * decay;
+        right[i] = (Math.random() * 2 - 1) * decay;
+      }
+
+      convolver.buffer = impulse;
+    }
+
+    // Initialize the reverb
+    createReverb();
+
+    function playSineTone(frequency) {
+      const oscillator = audioContext.createOscillator();
+      const gainNode = audioContext.createGain();
+
+      oscillator.type = CONFIG.audio.toneType;
+      oscillator.frequency.setValueAtTime(frequency, audioContext.currentTime);
+
+      // Connect nodes: oscillator -> gain -> convolver -> destination
+      oscillator.connect(gainNode);
+      gainNode.connect(convolver);
+      convolver.connect(audioContext.destination);
+
+      // ADSR envelope
+      const now = audioContext.currentTime;
+      const attackEnd = now + CONFIG.audio.attack;
+      const decayEnd = attackEnd + CONFIG.audio.decay;
+      const releaseStart = now + CONFIG.audio.toneDuration;
+
+      // Attack: Ramp up to full volume
+      gainNode.gain.setValueAtTime(0, now);
+      gainNode.gain.linearRampToValueAtTime(CONFIG.audio.toneVolume, attackEnd);
+
+      // Decay: Ramp down to sustain level
+      gainNode.gain.linearRampToValueAtTime(CONFIG.audio.toneVolume * CONFIG.audio.sustain, decayEnd);
+
+      // Sustain: Hold the sustain level
+      gainNode.gain.setValueAtTime(CONFIG.audio.toneVolume * CONFIG.audio.sustain, releaseStart);
+
+      // Release: Fade out to 0
+      gainNode.gain.linearRampToValueAtTime(0, releaseStart + CONFIG.audio.release);
+
+      // Start and stop the oscillator
+      oscillator.start(now);
+      oscillator.stop(releaseStart + CONFIG.audio.release);
+    }
+
+    function getRandomFrequency() {
+      if (CONFIG.audio.activeScale === 'cMajor') {
+        return CONFIG.audio.cMajorFrequencies[Math.floor(Math.random() * CONFIG.audio.cMajorFrequencies.length)];
+      } else {
+        return CONFIG.audio.dMinor7Frequencies[Math.floor(Math.random() * CONFIG.audio.dMinor7Frequencies.length)];
+      }
+    }
+
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    window.addEventListener('resize', () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      resetParticles();
+    });
+
+    document.addEventListener('mousemove', e => {
+      mouse.x = e.clientX;
+      mouse.y = e.clientY;
+    });
+
+    resetButton.addEventListener('click', resetParticles);
+
+    let continuousOscillator = null;
+    let continuousGainNode = null;
+    let lastMouseX = null;
+
+    function startContinuousTone() {
+      if (continuousOscillator) return; // Prevent multiple oscillators from being created
+
+      continuousOscillator = audioContext.createOscillator();
+      continuousGainNode = audioContext.createGain();
+
+      continuousOscillator.type = CONFIG.audio.toneType;
+      continuousOscillator.frequency.setValueAtTime(CONFIG.audio.continuousToneBaseFrequency, audioContext.currentTime);
+      continuousGainNode.gain.setValueAtTime(CONFIG.audio.toneVolume, audioContext.currentTime);
+
+      // Connect nodes: oscillator -> gain -> convolver -> destination
+      continuousOscillator.connect(continuousGainNode);
+      continuousGainNode.connect(convolver); // Route through the reverb
+      convolver.connect(audioContext.destination);
+
+      continuousOscillator.start();
+    }
+
+    function stopContinuousTone() {
+      if (continuousOscillator) {
+        continuousOscillator.stop();
+        continuousOscillator.disconnect();
+        continuousGainNode.disconnect();
+        continuousOscillator = null;
+        continuousGainNode = null;
+      }
+    }
+
+    canvas.addEventListener('mousedown', () => {
+      isDrawing = true;
+      paths.push({ points: [], startTime: performance.now() }); // Add startTime here
+      startContinuousTone(); // Start the continuous tone
+    });
+
+    canvas.addEventListener('mousemove', e => {
+      if (isDrawing) {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+
+        // Update the frequency based on the y position
+        const normalizedY = y / canvas.height;
+        const frequency = CONFIG.audio.continuousToneBaseFrequency +
+          normalizedY * (CONFIG.audio.continuousToneMaxFrequency - CONFIG.audio.continuousToneBaseFrequency);
+        if (continuousOscillator) {
+          continuousOscillator.frequency.setValueAtTime(frequency, audioContext.currentTime);
+        }
+
+        // Calculate tremolo effect based on x movement speed
+        if (lastMouseX !== null) {
+          const dx = Math.abs(x - lastMouseX);
+          const tremoloSpeed = dx * CONFIG.audio.tremoloSpeedFactor;
+          const tremoloDepth = CONFIG.audio.tremoloDepth;
+
+          if (continuousGainNode) {
+            const now = audioContext.currentTime;
+            continuousGainNode.gain.cancelScheduledValues(now);
+            continuousGainNode.gain.setValueAtTime(CONFIG.audio.toneVolume, now);
+            continuousGainNode.gain.setValueAtTime(CONFIG.audio.toneVolume * (1 - tremoloDepth), now + tremoloSpeed);
+            continuousGainNode.gain.setValueAtTime(CONFIG.audio.toneVolume, now + tremoloSpeed * 2);
+          }
+        }
+
+        lastMouseX = x;
+
+        // Add the point to the current path
+        paths[paths.length - 1].points.push({ x, y });
+      }
+    });
+
+    canvas.addEventListener('mouseup', () => {
+      isDrawing = false;
+      stopContinuousTone(); // Stop the continuous tone
+
+      // Close the loop by connecting the last point to the first point
+      if (paths.length > 0 && paths[paths.length - 1].length > 1) {
+        const currentPath = paths[paths.length - 1];
+        const firstPoint = currentPath[0];
+        const lastPoint = currentPath[currentPath.length - 1];
+
+        // Add the first point to the end of the path to close the loop
+        if (lastPoint.x !== firstPoint.x || lastPoint.y !== firstPoint.y) {
+          currentPath.push({ x: firstPoint.x, y: firstPoint.y });
+        }
+      }
+    });
+
+    function resetParticles() {
+      particles = [];
+      for (let i = 0; i < CONFIG.particles.count; i++) {
+        particles.push({
+          x: Math.random() * canvas.width,
+          y: Math.random() * canvas.height,
+          vx: 0,
+          vy: 0
+        });
+      }
+      paths = []; // Clear paths on reset
+    }
+
+    function updateParticles() {
+      const time = performance.now() / 1000; // Use time to create smooth motion
+      const explosions = []; // Store explosion locations
+
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        let clusterCount = 0;
+
+        // Check for nearby particles to detect clusters
+        for (let j = 0; j < particles.length; j++) {
+          if (i === j) continue; // Skip self-check
+          const other = particles[j];
+          const dx = p.x - other.x;
+          const dy = p.y - other.y;
+          const distSquared = dx * dx + dy * dy;
+
+          if (distSquared < CONFIG.particles.explosionRadius ** 2) {
+            clusterCount++;
+          }
+        }
+
+        // Trigger explosion if cluster exceeds threshold
+        if (clusterCount >= CONFIG.particles.explosionThreshold) {
+          explosions.push({ x: p.x, y: p.y });
+
+          // Change the active scale when an explosion occurs
+          CONFIG.audio.toggleScale();
+        }
+
+        // Apply explosion repulsion
+        for (const explosion of explosions) {
+          const dx = p.x - explosion.x;
+          const dy = p.y - explosion.y;
+          const distSquared = dx * dx + dy * dy;
+
+          if (distSquared < CONFIG.particles.explosionRadius ** 2) {
+            const dist = Math.sqrt(distSquared);
+            const force = (CONFIG.particles.explosionRadius - dist) / CONFIG.particles.explosionRadius;
+            p.vx += (dx / dist) * force * CONFIG.particles.explosionForce;
+            p.vy += (dy / dist) * force * CONFIG.particles.explosionForce;
+          }
+        }
+
+        // Existing particle update logic
+        let closestSegment = null;
+        let minDist = Infinity;
+
+        // Find the closest segment on the paths
+        for (const path of paths) {
+          for (let j = 0; j < path.points.length - 1; j++) { // Access path.points
+            const pointA = path.points[j];
+            const pointB = path.points[j + 1];
+
+            // Calculate the closest point on the segment to the particle
+            const dx = pointB.x - pointA.x;
+            const dy = pointB.y - pointA.y;
+            const lengthSquared = dx * dx + dy * dy;
+            const t = Math.max(0, Math.min(1, ((p.x - pointA.x) * dx + (p.y - pointA.y) * dy) / lengthSquared));
+            const closestX = pointA.x + t * dx;
+            const closestY = pointA.y + t * dy;
+
+            // Calculate the distance to the closest point
+            const dist = Math.sqrt((p.x - closestX) ** 2 + (p.y - closestY) ** 2);
+            if (dist < minDist) {
+              minDist = dist;
+              closestSegment = { x: closestX, y: closestY, dx, dy };
+            }
+          }
+        }
+
+        if (closestSegment) {
+          // Move particles along the segment direction
+          const angle = Math.atan2(closestSegment.dy, closestSegment.dx);
+          p.vx += Math.cos(angle) * 0.1;
+          p.vy += Math.sin(angle) * 0.1;
+        }
+
+        // Apply a repelling force near the edges of the canvas
+        if (p.x < CONFIG.particles.edgeThreshold) {
+          p.vx += (CONFIG.particles.edgeThreshold - p.x) / CONFIG.particles.edgeForce;
+        } else if (p.x > canvas.width - CONFIG.particles.edgeThreshold) {
+          p.vx -= (p.x - (canvas.width - CONFIG.particles.edgeThreshold)) / CONFIG.particles.edgeForce;
+        }
+
+        if (p.y < CONFIG.particles.edgeThreshold) {
+          p.vy += (CONFIG.particles.edgeThreshold - p.y) / CONFIG.particles.edgeForce;
+        } else if (p.y > canvas.height - CONFIG.particles.edgeThreshold) {
+          p.vy -= (p.y - (canvas.height - CONFIG.particles.edgeThreshold)) / CONFIG.particles.edgeForce;
+        }
+
+        // Apply repelling force between particles and play tone if close
+        for (let j = 0; j < particles.length; j++) {
+          if (i === j) continue; // Skip self-repulsion
+          const other = particles[j];
+          const dx = p.x - other.x;
+          const dy = p.y - other.y;
+          const distSquared = dx * dx + dy * dy;
+
+          if (distSquared < CONFIG.particles.closeDistance) { // Play tone if within close distance
+            const now = performance.now();
+            if (now - lastToneTime > CONFIG.audio.minInterval) {
+              const frequency = getRandomFrequency();
+              playSineTone(frequency);
+              lastToneTime = now;
+
+              // Add a flash circle to the flashes array
+              flashes.push({
+                x: (p.x + other.x) / 2, // Correctly calculate the midpoint
+                y: (p.y + other.y) / 2, // Correctly calculate the midpoint
+                radius: CONFIG.effects.flashRadius,
+                opacity: 1.0, // Start fully opaque
+              });
+            }
+          }
+
+          if (distSquared < CONFIG.particles.repelDistance) {
+            const dist = Math.sqrt(distSquared);
+            const force = (30 - dist) / 30; // Strength of repulsion decreases with distance
+            p.vx += (dx / dist) * force * CONFIG.particles.repelStrength;
+            p.vy += (dy / dist) * force * CONFIG.particles.repelStrength;
+          }
+        }
+
+        // Add smooth random motion to the particle
+        p.vx += Math.sin(time + i) * CONFIG.particles.randomMotionStrength;
+        p.vy += Math.cos(time + i) * CONFIG.particles.randomMotionStrength;
+
+        // Apply velocity damping
+        p.vx *= CONFIG.particles.damping;
+        p.vy *= CONFIG.particles.damping;
+
+        // Update particle position
+        p.x += p.vx;
+        p.y += p.vy;
+      }
+
+      // Handle explosion visuals
+      drawExplosions(explosions);
+    }
+
+    function drawExplosions(explosions) {
+      for (const explosion of explosions) {
+        ctx.beginPath();
+        ctx.arc(explosion.x, explosion.y, CONFIG.particles.explosionRadius, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255, 69, 0, 0.5)'; // Semi-transparent orange
+        ctx.fill();
+      }
+    }
+
+    function drawFlashes() {
+      for (let i = flashes.length - 1; i >= 0; i--) {
+        const flash = flashes[i];
+        ctx.beginPath();
+        ctx.arc(flash.x, flash.y, flash.radius, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255, 255, 255, ${flash.opacity})`;
+        ctx.fill();
+
+        // Reduce opacity over time
+        flash.opacity -= CONFIG.effects.flashFadeSpeed;
+        if (flash.opacity <= 0) {
+          flashes.splice(i, 1); // Remove the flash when fully transparent
+        }
+      }
+    }
+
+    function drawParticles() {
+      // Draw a semi-transparent rectangle to create a fading trail effect
+      ctx.fillStyle = `rgba(0, 0, 0, ${CONFIG.effects.trailOpacity})`;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Draw flashes
+      drawFlashes();
+
+      // Draw paths with fading effect
+      for (let i = paths.length - 1; i >= 0; i--) {
+        const path = paths[i];
+        const elapsedTime = (performance.now() - path.startTime) / 1000; // Time in seconds
+
+        if (elapsedTime > CONFIG.paths.fadeDuration) {
+          paths.splice(i, 1); // Remove the path if it has exceeded the fade duration
+          continue;
+        }
+
+        const alpha = 1 - elapsedTime / CONFIG.paths.fadeDuration; // Calculate fading alpha
+        const color = CONFIG.paths.lineColor.replace(/[\d.]+\)$/g, `${alpha})`); // Adjust alpha dynamically
+        ctx.strokeStyle = color;
+        ctx.lineWidth = CONFIG.paths.lineWidth;
+
+        for (let j = 0; j < path.points.length - 1; j++) {
+          const pointA = path.points[j];
+          const pointB = path.points[j + 1];
+
+          ctx.beginPath();
+          ctx.moveTo(pointA.x, pointA.y);
+          ctx.lineTo(pointB.x, pointB.y);
+          ctx.stroke();
+        }
+      }
+
+      // Draw particles as fishes
+      for (let i = 0; i < particles.length; i++) {
+        const p = particles[i];
+        const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+        const color = `hsl(${Math.min(speed * 100, 360)}, 100%, 50%)`;
+
+        // Calculate the angle of movement for the fish
+        const angle = Math.atan2(p.vy, p.vx);
+
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(angle);
+
+        // Draw fish body
+        ctx.beginPath();
+        ctx.ellipse(0, 0, CONFIG.fish.bodyLength, CONFIG.fish.bodyWidth, 0, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+
+        // Draw fish tail with wiggle effect
+        const tailWiggle = Math.sin(performance.now() / 100 + i) * CONFIG.fish.tailWidth; // Wiggle effect
+        ctx.beginPath();
+        ctx.moveTo(-CONFIG.fish.bodyLength, 0);
+        ctx.lineTo(-(CONFIG.fish.bodyLength + CONFIG.fish.tailLength), -tailWiggle);
+        ctx.lineTo(-(CONFIG.fish.bodyLength + CONFIG.fish.tailLength), tailWiggle);
+        ctx.closePath();
+        ctx.fillStyle = color;
+        ctx.fill();
+
+        ctx.restore();
+      }
+    }
+
+    function animate() {
+      updateParticles();
+      drawParticles();
+      requestAnimationFrame(animate);
+    }
+
+    resetParticles();
+    animate();
+  </script>
+</body>
+</html>
